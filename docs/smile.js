@@ -200,7 +200,7 @@
     const seen = new Uint8Array(S * S), stack = new Int32Array(S * S);
     const chosen = {}, rejected = [];
     for (let c = 1; c <= 6; c++) {
-      let best = null;
+      let best = null; const cands = [];
       for (let i0 = 0; i0 < S * S; i0++) {
         if (labels[i0] !== c || seen[i0] || !inMouth[i0]) continue;
         let sp = 0; stack[sp++] = i0; seen[i0] = 1;
@@ -215,11 +215,15 @@
         }
         if (comp.length < minArea) continue;
         const mx = cx / comp.length, uy = chainY(upL, mx), ly = chainY(loL, mx);
-        const openH = Math.max(1, ly - uy);
-        // an upper tooth starts at the upper lip / gum line; a component that starts in the lower part of the mouth is a lower tooth
-        if (ymin > uy + (opts.lowerStart ?? 0.45) * openH) { rejected.push({ c, area: comp.length, reason: 'lower' }); continue; }
-        if (!best || comp.length > best.comp.length) best = { comp, conf: cs / comp.length, mx };
+        const rel = (ymin - uy) / Math.max(1, ly - uy);           // 0 = at the upper lip, 1 = at the lower lip
+        cands.push({ comp, conf: cs / comp.length, mx, rel, c });
       }
+      // an upper tooth starts near the upper lip / gum line. Prefer components that start high; a component that starts
+      // near the lower lip is a lower tooth. With a gummy smile upper teeth start lower, so the limit is generous.
+      const high = cands.filter((k) => k.rel <= (opts.lowerStart ?? 0.45)), mid = cands.filter((k) => k.rel > (opts.lowerStart ?? 0.45) && k.rel <= 0.62);
+      const pool = high.length ? high : mid;
+      for (const k of cands) if (!pool.includes(k)) rejected.push({ c, area: k.comp.length, reason: 'lower' });
+      for (const k of pool) if (!best || k.comp.length > best.comp.length) best = k;
       if (best) chosen[c] = best;
     }
     const clean = new Uint8Array(S * S);
@@ -289,19 +293,63 @@
       for (let k = i + 1; k < 6; k++) if (sel.teeth[TEETH[k]]) { R = TEETH[k]; break; }
       if (L && R) {
         const gap = sel.teeth[R].x0 - sel.teeth[L].x1;
-        // dark gap between neighbours → tooth missing; otherwise neighbours already touch (model merged/missed it)
-        status[t] = gap >= 0.45 * unit * IDEAL[t] && darkFraction(rgba, w, h, sel.teeth[L].x1, sel.teeth[R].x0, sel.teeth[L], sel.teeth[R]) > 0.45 ? 'missing' : 'unsure';
-      } else status[t] = 'hidden';
+        // a real gap between neighbours (dark space, or pink gum where a tooth was lost) → missing; otherwise the model missed it
+        status[t] = gap >= 0.45 * unit * IDEAL[t] && nonToothFraction(rgba, w, h, sel.teeth[L].x1, sel.teeth[R].x0, sel.teeth[L], sel.teeth[R]) > 0.55 ? 'missing' : 'unsure';
+      } else {
+        // end tooth (canine) not labelled: look where it should be, next to the lateral, inside the mouth opening
+        const N = L || R, nb = sel.teeth[N], cw = 0.8 * (nb.x1 - nb.x0);
+        const xa = L ? nb.x1 : nb.x0 - cw, xb = L ? nb.x1 + cw : nb.x0;
+        const f = stripFractions(rgba, w, h, xa, xb, nb.y0, nb.y1, lips);
+        // a dark corner is usually the buccal corridor, not a lost canine: stay conservative (the doctor can mark it missing)
+        status[t] = !f || f.inMouth < 0.3 ? 'hidden' : f.tooth >= 0.45 ? 'estimated' : f.tooth >= 0.2 ? 'unsure' : 'hidden';
+      }
     }
     return status;
   }
-  function darkFraction(rgba, w, h, xa, xb, A, B) {
+  const toothLike = (r, g, b) => (0.299 * r + 0.587 * g + 0.114 * b) > 115 && (Math.max(r, g, b) - Math.min(r, g, b)) < 70;
+  function nonToothFraction(rgba, w, h, xa, xb, A, B) {
     const y0 = Math.round(Math.max(A.y0, B.y0)), y1 = Math.round(Math.min(A.y1, B.y1));
     let n = 0, d = 0;
     for (let y = Math.max(0, y0); y <= Math.min(h - 1, y1); y += 2) for (let x = Math.max(0, Math.round(xa)); x <= Math.min(w - 1, Math.round(xb)); x += 2) {
-      const i = (y * w + x) * 4; n++; if (0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2] < 90) d++;
+      const i = (y * w + x) * 4; n++; if (!toothLike(rgba[i], rgba[i + 1], rgba[i + 2])) d++;
     }
     return n ? d / n : 0;
+  }
+
+  function stripFractions(rgba, w, h, xa, xb, ya, yb, lips) {
+    const poly = lips && lips.poly; let n = 0, inM = 0, tooth = 0, dark = 0;
+    for (let y = Math.max(0, Math.round(ya)); y <= Math.min(h - 1, Math.round(yb)); y += 2) for (let x = Math.max(0, Math.round(xa)); x <= Math.min(w - 1, Math.round(xb)); x += 2) {
+      n++; if (poly && !pointInPoly(x, y, poly)) continue; inM++;
+      const i = (y * w + x) * 4, r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+      if (toothLike(r, g, b)) tooth++; else if (0.299 * r + 0.587 * g + 0.114 * b < 70) dark++;
+    }
+    return inM ? { tooth: tooth / inM, dark: dark / inM, inMouth: inM / Math.max(1, n) } : null;
+  }
+
+  // A fractured incisor is much shorter than its counterpart (or, for both centrals, far too wide for its length)
+  function detectBroken(teeth, status) {
+    const out = [], ok = (t) => teeth[t] && status[t] === 'present', H = (t) => teeth[t].y1 - teeth[t].y0, W = (t) => teeth[t].x1 - teeth[t].x0;
+    for (const [a, b] of [['11', '21'], ['12', '22']]) {
+      if (ok(a) && ok(b)) { if (H(a) < 0.78 * H(b)) out.push(a); else if (H(b) < 0.78 * H(a)) out.push(b); }
+    }
+    for (const t of ['11', '21']) if (ok(t) && !out.includes(t) && W(t) / Math.max(1, H(t)) > 1.35) out.push(t);
+    return out;
+  }
+
+  // No front teeth at all (trauma, extraction): place an ideal anterior set from the face itself.
+  // lips: crop-space chains; midX: facial midline at the mouth (crop px); mmpp: mm per crop px (or null).
+  function designFromFace(lips, midX, mmpp, opts = {}) {
+    const up = lips.upper, lo = lips.lower;
+    const xs = up.map((p) => p.x), mouthW = Math.max(...xs) - Math.min(...xs);
+    const cW = mmpp ? (opts.centralWidthMm || 8.6) / mmpp : mouthW * 0.155;
+    const cL = mmpp ? (opts.centralLenMm || 10.5) / mmpp : cW / 0.8;
+    const p = opts.p || 0.7, ws = [p * p, p, 1, 1, p, p * p].map((k) => k * cW), lens = [0.95, 0.85, 1, 1, 0.85, 0.95];
+    const T = {}; let x = midX - cW - p * cW - p * p * cW;
+    TEETH.forEach((t, i) => {
+      const cx = x + ws[i] / 2, top = chainY(up, cx) - (mmpp ? 1 / mmpp : cL * 0.1);   // the neck sits just under the upper lip
+      T[t] = { x0: x, x1: x + ws[i], y0: top, y1: top + cL * lens[i] }; x += ws[i];
+    });
+    return T;
   }
 
   function irisMmPerPx(P) {
@@ -336,12 +384,12 @@
   }
 
   // Keep automatic changes within what is usually achievable with veneers/crowns; the doctor can go further on purpose.
-  function limitChanges(current, target, mmpp, lim = {}) {
+  function limitChanges(current, target, mmpp, lim = {}, status = {}) {
     const L = Object.assign({ shortenMm: 1.5, lengthenMm: 2.5, widthMm: 1.5 }, lim), out = {};
     const px = (mm) => mmpp ? mm / mmpp : null;
     for (const t of TEETH) {
       const a = current[t], b = target[t]; if (!b) continue; out[t] = { ...b };
-      if (!a || !mmpp) continue;
+      if (!a || !mmpp || (status[t] && status[t] !== 'present')) continue;   // a missing or broken tooth is rebuilt in full
       out[t].y1 = clamp(b.y1, a.y1 - px(L.shortenMm), a.y1 + px(L.lengthenMm));
     }
     return out;
@@ -383,7 +431,7 @@
   }
 
   const api = { LM, INNER_UPPER, INNER_LOWER, OUTER_LIP, IRIS_MM, QUALITY_DEFAULTS, toPx, uprightTurns, eyes, pose, innerLipPolygon, imageStats,
-    qualityChecks, mouthCrop, invertAffine, applyAffine, pointInPoly, rasterPoly, dilate, chainY, selectUpperTeeth, classifyAbsent,
+    qualityChecks, mouthCrop, invertAffine, applyAffine, pointInPoly, rasterPoly, dilate, chainY, selectUpperTeeth, classifyAbsent, detectBroken, designFromFace,
     irisMmPerPx, applySmileArc, limitChanges, facePoints, dentitionExtent };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.DSDSmile = api;
 })(typeof window !== 'undefined' ? window : globalThis);

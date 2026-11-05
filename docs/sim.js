@@ -198,78 +198,143 @@
   }
 
   /*
-    opts: {
-      crop: original mouth crop image, mouthMask: Uint8 (inner-lip polygon, crop size),
-      toothMasks: {t: Uint8 mask (crop size)} of the patient's current teeth (selected upper six),
-      current: {t: box}, target: {t: box}, treat: {t: 'veneer'|'crown'|'composite'|'implant'|'pontic'|'none'...},
-      status: {t: 'present'|'missing'|'broken'|'hidden'|'unsure'}, shape, shadeHex, whiten (0..1), library: {t: {img, mask}} optional
-    }
-    returns { img, alpha } — the edited crop and the blend weight for pasting back
+    Morph the patient's own photo: every tooth is stretched/narrowed/lengthened to its designed box (texture, highlights,
+    gum and lower teeth are kept), gaps close, then a texture-preserving whitening. Only missing/broken teeth are painted
+    (from the counterpart tooth or the library).
+    opts: { crop, mouthMask, toothMasks:{t:Uint8}, current:{t:box} (all six), target:{t:box}, treat, status, shape, shadeHex, whiten, library }
+    returns { img, alpha }
   */
   function simulate(o) {
     const { crop, mouthMask } = o, w = crop.w, h = crop.h;
-    const treated = TEETH.filter((t) => o.target[t] && (o.treat[t] || 'veneer') !== 'none');
-    // 1. remove the treated teeth (fill from their surroundings) so narrower / shorter new teeth reveal mouth, not old enamel
-    const old = new Uint8Array(w * h);
-    for (const t of treated) { const m = o.toothMasks[t]; if (m) for (let k = 0; k < w * h; k++) if (m[k]) old[k] = 1; }
-    const oldD = dilate(old, w, h, 3);
-    const hole = new Uint8Array(w * h); for (let k = 0; k < w * h; k++) hole[k] = oldD[k] && mouthMask[k] ? 1 : 0;
-    const base = inpaint(crop, hole);
-    // the space behind the teeth is the dark mouth interior; near the gum line it stays gum-coloured (papillae)
-    const cur = TEETH.map((t) => o.current[t]).filter(Boolean);
-    const gumY = cur.length ? cur.reduce((a, b) => a + b.y0, 0) / cur.length : 0, tH = cur.length ? cur.reduce((a, b) => a + (b.y1 - b.y0), 0) / cur.length : h;
-    const dark = darkColour(crop, mouthMask, old);
-    for (let y = 0; y < h; y++) {
-      const g = clamp((y - gumY - 0.12 * tH) / (0.3 * tH), 0, 1) * 0.92;
-      if (g <= 0) continue;
-      for (let x = 0; x < w; x++) { const i = y * w + x; if (hole[i]) for (let c = 0; c < 3; c++) base.data[i * 4 + c] = base.data[i * 4 + c] * (1 - g) + dark[c] * g; }
+    const treat = (t) => (o.treat[t] || 'veneer') !== 'none';
+    const cur = o.current, tgt = {};
+    for (const t of TEETH) tgt[t] = treat(t) && o.target[t] ? o.target[t] : cur[t];
+    // ---- 1. horizontal map: tooth edges (current) → tooth edges (target); gaps between teeth collapse to the contact point
+    const sk = [0], dk = [0];
+    let prev = -Infinity;
+    for (let i = 0; i < 6; i++) {
+      const t = TEETH[i], a = cur[t], b = tgt[t];
+      let x0 = a.x0, x1 = a.x1;
+      if (x0 < prev) x0 = prev;                     // overlapping boxes: share the edge
+      if (x1 < x0 + 1) x1 = x0 + 1;
+      sk.push(x0, x1); dk.push(b.x0, b.x1); prev = x1;
     }
-    // 2. reference enamel statistics and target colour
-    const allTeeth = new Uint8Array(w * h);
-    for (const t of TEETH) { const m = o.toothMasks[t]; if (m && o.status[t] !== 'missing') for (let k = 0; k < w * h; k++) if (m[k]) allTeeth[k] = 1; }
-    const ref = labStats(crop, erode(allTeeth, w, h, 2)) || { mean: [75, 2, 15], std: [8, 2, 4] };
-    const shade = hexLab(o.shadeHex || '#EEE6D4'), s = clamp(o.whiten ?? 1, 0, 1);
-    const tgtL = ref.mean[0] + (Math.max(shade[0], ref.mean[0]) - ref.mean[0]) * s;
-    const tgtA = ref.mean[1] + (shade[1] - ref.mean[1]) * s, tgtB = ref.mean[2] + (shade[2] - ref.mean[2]) * s;
-    // 3. draw new teeth: canines first, centrals last (they overlap the laterals)
-    const out = copyImg(base), lab = [0, 0, 0], rgb = [0, 0, 0], px = [0, 0, 0];
-    const order = ['13', '23', '12', '22', '11', '21'].filter((t) => treated.includes(t));
-    const patches = {};
-    for (const t of order) {
-      const usable = (k) => o.status[k] !== 'missing' && o.status[k] !== 'broken' && o.status[k] !== 'hidden' && o.toothMasks[k] && o.current[k];
-      let srcKey = null, flip = false, patch = null;
-      if (usable(t)) srcKey = t; else if (usable(MIRROR[t])) { srcKey = MIRROR[t]; flip = true; }
-      if (srcKey) patch = patches[srcKey] || (patches[srcKey] = toothPatch(crop, o.toothMasks[srcKey], o.current[srcKey]));
-      else if (o.library && o.library[t]) patch = o.library[t];
-      else if (o.library && o.library[MIRROR[t]]) { patch = o.library[MIRROR[t]]; flip = true; }
+    sk.push(w - 1); dk.push(w - 1);
+    for (let i = 1; i < dk.length; i++) if (dk[i] < dk[i - 1]) dk[i] = dk[i - 1];   // keep monotonic
+    const invX = (x) => {                         // dst x → src x
+      if (x <= dk[0]) return sk[0];
+      for (let i = 1; i < dk.length; i++) if (x <= dk[i]) { const span = dk[i] - dk[i - 1]; return span < 1e-6 ? sk[i] : sk[i - 1] + (x - dk[i - 1]) * (sk[i] - sk[i - 1]) / span; }
+      return sk[sk.length - 1];
+    };
+    // ---- 2. vertical map per column: gum line fixed, crown stretched to the new incisal edge, the area below follows down to the lower lip
+    const centers = TEETH.map((t) => (tgt[t].x0 + tgt[t].x1) / 2);
+    const P = (t) => ({ y0c: cur[t].y0, y1c: cur[t].y1, y0t: tgt[t].y0, y1t: tgt[t].y1 });
+    const params = TEETH.map(P);
+    const colPar = new Array(w);
+    for (let x = 0; x < w; x++) {
+      let k = 0; while (k < 5 && x > centers[k + 1]) k++;
+      let a = params[k], b = params[Math.min(5, k + 1)], f = 0;
+      if (x <= centers[0]) { b = a; f = 0; } else if (x >= centers[5]) { a = b = params[5]; } else f = (x - centers[k]) / Math.max(1, centers[k + 1] - centers[k]);
+      const L = (u, v) => u + (v - u) * f;
+      // fade the vertical change to nothing towards the mouth corners
+      const fade = x < tgt['13'].x0 ? clamp(1 - (tgt['13'].x0 - x) / Math.max(1, tgt['13'].x1 - tgt['13'].x0), 0, 1) : x > tgt['23'].x1 ? clamp(1 - (x - tgt['23'].x1) / Math.max(1, tgt['23'].x1 - tgt['23'].x0), 0, 1) : 1;
+      const y0c = L(a.y0c, b.y0c), y1c = L(a.y1c, b.y1c), y0t = L(a.y0t, b.y0t), y1t = L(a.y1t, b.y1t);
+      colPar[x] = { y0c, y1c, y0t: y0c + (y0t - y0c) * fade, y1t: y1c + (y1t - y1c) * fade };
+    }
+    const bottom = new Float32Array(w).fill(h - 1);
+    for (let x = 0; x < w; x++) { for (let y = h - 1; y >= 0; y--) if (mouthMask[y * w + x]) { bottom[x] = y; break; } }
+    const invY = (x, y) => {
+      const c = colPar[Math.max(0, Math.min(w - 1, Math.round(x)))], yb = Math.max(bottom[Math.max(0, Math.min(w - 1, Math.round(x)))], c.y1t + 2, c.y1c + 2);
+      if (y <= c.y0t) return y - c.y0t + c.y0c;
+      if (y <= c.y1t) return c.y0c + (y - c.y0t) * (c.y1c - c.y0c) / Math.max(1, c.y1t - c.y0t);
+      if (y <= yb) return c.y1c + (y - c.y1t) * (yb - c.y1c) / Math.max(1, yb - c.y1t);
+      return y;
+    };
+    // ---- 3. warp the mouth interior; warp the tooth masks the same way
+    const out = copyImg(crop), px = [0, 0, 0];
+    const oldTeeth = new Uint8Array(w * h);
+    for (const t of TEETH) { const m = o.toothMasks[t]; if (m && treat(t) && o.status[t] !== 'missing') for (let k = 0; k < w * h; k++) if (m[k]) oldTeeth[k] = 1; }
+    const toothDst = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const k = y * w + x; if (!mouthMask[k]) continue;
+      const sx = invX(x), sy = invY(x, y);
+      sample(crop, sx, sy, px);
+      out.data[k * 4] = px[0]; out.data[k * 4 + 1] = px[1]; out.data[k * 4 + 2] = px[2];
+      const mi = clamp(Math.round(sy), 0, h - 1) * w + clamp(Math.round(sx), 0, w - 1);
+      if (oldTeeth[mi]) toothDst[k] = 1;
+    }
+    // ---- 4. reference enamel colour (after warping) and target colour
+    const ref = labStats(out, erode(toothDst, w, h, 2));
+    const lib = o.library || {};
+    const libRef = Object.values(lib).find((l) => l && l.stats)?.stats;
+    const base = ref || libRef || { mean: [72, 2, 16], std: [7, 2, 4] };
+    const shade = hexLab(o.shadeHex || '#F0E9D8'), s = clamp(o.whiten ?? 1, 0, 1);
+    const tL = Math.max(base.mean[0], base.mean[0] + (shade[0] - base.mean[0]) * s), tA = base.mean[1] + (shade[1] - base.mean[1]) * s, tB = base.mean[2] + (shade[2] - base.mean[2]) * s;
+    const lab = [0, 0, 0], rgb = [0, 0, 0];
+    // ---- 5. paint missing / broken teeth from the counterpart tooth (or library), matched to the patient's enamel
+    const painted = new Uint8Array(w * h);
+    const usable = (k) => o.status[k] === 'present' && o.toothMasks[k] && cur[k];
+    for (const t of ['13', '23', '12', '22', '11', '21']) {
+      if (!treat(t) || (o.status[t] !== 'missing' && o.status[t] !== 'broken' && o.status[t] !== 'unsure')) continue;
+      let patch = null, flip = false;
+      if (usable(MIRROR[t])) { patch = toothPatch(crop, o.toothMasks[MIRROR[t]], cur[MIRROR[t]]); flip = true; }
+      else if (lib[t]) patch = lib[t]; else if (lib[MIRROR[t]]) { patch = lib[MIRROR[t]]; flip = true; }
       if (!patch || !patch.stats) continue;
-      const st = patch.stats, kL = clamp(6 / Math.max(1, st.std[0]), 0.55, 1.0);   // keep enamel texture, soften stains
-      const b = o.target[t], poly = toothPolygon(o.shape || 'square', b, t === '13' || t === '23');
-      const pm = rasterPoly(poly, w, h), alpha = blurAlpha(Float32Array.from(pm), w, h, 1);
-      const bx0 = Math.max(0, Math.floor(b.x0) - 2), bx1 = Math.min(w - 1, Math.ceil(b.x1) + 2), by0 = Math.max(0, Math.floor(b.y0) - 2), by1 = Math.min(h - 1, Math.ceil(b.y1) + 2);
-      const bw = b.x1 - b.x0, bh = b.y1 - b.y0, P = patch.img;
-      for (let y = by0; y <= by1; y++) for (let x = bx0; x <= bx1; x++) {
-        const k = y * w + x, a = Math.min(alpha[k] * 1.15, 1) * (mouthMask[k] ? 1 : 0); if (a <= 0.01) continue;
+      const b = tgt[t], poly = toothPolygon(o.shape || 'square', b, t === '13' || t === '23'), pm = rasterPoly(poly, w, h), al = blurAlpha(Float32Array.from(pm), w, h, 1);
+      const st = patch.stats, bw = b.x1 - b.x0, bh = b.y1 - b.y0, Pi = patch.img;
+      for (let y = Math.max(0, Math.floor(b.y0) - 2); y <= Math.min(h - 1, Math.ceil(b.y1) + 2); y++) for (let x = Math.max(0, Math.floor(b.x0) - 2); x <= Math.min(w - 1, Math.ceil(b.x1) + 2); x++) {
+        const k = y * w + x, a = Math.min(1, al[k] * 1.15) * (mouthMask[k] ? 1 : 0); if (a <= 0.01) continue;
         const u = clamp((x - b.x0) / bw, 0, 1), v = clamp((y - b.y0) / bh, 0, 1);
-        sample(P, (flip ? 1 - u : u) * (P.w - 1), v * (P.h - 1), px);
-        rgb2lab(px[0], px[1], px[2], lab);
-        let L = tgtL + (lab[0] - st.mean[0]) * kL, A = tgtA + (lab[1] - st.mean[1]) * 0.5, B = tgtB + (lab[2] - st.mean[2]) * 0.5;
-        // form: rounded labial surface (darker towards contacts), cervical shadow, incisal translucency
-        const side = Math.abs(2 * u - 1);
-        L -= 9 * side ** 3 + 5 * Math.max(0, 0.18 - v) / 0.18;
-        if (v > 0.84) { const q = (v - 0.84) / 0.16; L -= 6 * q; B -= 5 * q; A -= 0.5 * q; }
-        lab2rgb(L, A, B, rgb);
+        sample(Pi, (flip ? 1 - u : u) * (Pi.w - 1), v * (Pi.h - 1), px); rgb2lab(px[0], px[1], px[2], lab);
+        lab2rgb(base.mean[0] + (lab[0] - st.mean[0]), base.mean[1] + (lab[1] - st.mean[1]) * 0.7, base.mean[2] + (lab[2] - st.mean[2]) * 0.7, rgb);
         for (let c = 0; c < 3; c++) out.data[k * 4 + c] = out.data[k * 4 + c] * (1 - a) + rgb[c] * a;
+        if (a > 0.5) { painted[k] = 1; toothDst[k] = 1; }
       }
     }
-    // 4. untreated teeth keep their original pixels; lips stay on top (only the mouth interior changes)
-    for (const t of TEETH) if (!treated.includes(t) && o.toothMasks[t]) { const m = o.toothMasks[t]; for (let k = 0; k < w * h; k++) if (m[k] && !hole[k]) for (let c = 0; c < 3; c++) out.data[k * 4 + c] = crop.data[k * 4 + c]; }
-    const alpha = blurAlpha(Float32Array.from(mouthMask), w, h, 1);
-    for (let k = 0; k < w * h; k++) {
-      const a = alpha[k]; if (a >= 1) continue;
-      for (let c = 0; c < 3; c++) out.data[k * 4 + c] = crop.data[k * 4 + c] * (1 - a) + out.data[k * 4 + c] * a;
+    // ---- 6. tooth form: round the incisal corners (what shows there is what is behind: lower teeth / mouth)
+    for (const t of TEETH) {
+      if (!treat(t)) continue;
+      const b = tgt[t], poly = toothPolygon(o.shape || 'square', b, t === '13' || t === '23'), pm = rasterPoly(poly, w, h), bh = b.y1 - b.y0;
+      const yStart = Math.round(b.y0 + 0.55 * bh);
+      for (let y = Math.max(0, yStart); y <= Math.min(h - 1, Math.ceil(b.y1)); y++) for (let x = Math.max(0, Math.floor(b.x0)); x <= Math.min(w - 1, Math.ceil(b.x1)); x++) {
+        const k = y * w + x; if (pm[k] || !toothDst[k] || !mouthMask[k]) continue;
+        const sy = Math.min(h - 1, Math.round(b.y1 + 0.06 * bh)), j = sy * w + x;      // just below the incisal edge
+        for (let c = 0; c < 3; c++) out.data[k * 4 + c] = out.data[j * 4 + c];
+        toothDst[k] = 0;
+      }
     }
-    return { img: out, alpha };
+    // ---- 7. whitening that keeps the enamel texture and highlights.
+    // The region is every enamel-coloured pixel inside the designed teeth (the model mask alone can miss parts of a tooth).
+    const refL = base.mean[0], refStd = Math.max(4, base.std[0]), refC = Math.hypot(base.mean[1], base.mean[2]);
+    const wm = new Uint8Array(w * h);
+    for (const t of TEETH) {
+      if (!treat(t)) continue;
+      const b = tgt[t], shapeM = dilate(rasterPoly(toothPolygon(o.shape || 'square', b, t === '13' || t === '23'), w, h), w, h, Math.max(3, Math.round(0.08 * (b.x1 - b.x0)))), yCut = b.y0 + 0.88 * (b.y1 - b.y0);
+      for (let y = Math.max(0, Math.floor(b.y0) - 1); y <= Math.min(h - 1, Math.ceil(b.y1)); y++) for (let x = Math.max(0, Math.floor(b.x0)); x <= Math.min(w - 1, Math.ceil(b.x1)); x++) {
+        const k = y * w + x; if (!mouthMask[k]) continue;
+        if (toothDst[k] && shapeM[k]) { wm[k] = 1; continue; }
+        if (!shapeM[k] || y > yCut) continue;                // near the incisal edge only the tooth itself (not the lower teeth behind it)
+        rgb2lab(out.data[k * 4], out.data[k * 4 + 1], out.data[k * 4 + 2], lab);
+        if (lab[0] >= refL - 2.2 * refStd && Math.hypot(lab[1], lab[2]) <= refC + 14 && lab[1] < 14) wm[k] = 1;   // enamel, not gum (gum is red: high a*)
+      }
+    }
+    const alpha = blurAlpha(Float32Array.from(wm), w, h, 2);
+    const dL = clamp(tL - refL, 0, 16);                      // natural whitening: at most ~16 L* units
+    const contacts = []; for (let i = 0; i < 5; i++) contacts.push(tgt[TEETH[i]].x1);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const k = y * w + x, a = alpha[k]; if (a <= 0.01 || !mouthMask[k]) continue;
+      rgb2lab(out.data[k * 4], out.data[k * 4 + 1], out.data[k * 4 + 2], lab);
+      const hi = clamp((lab[0] - refL) / Math.max(1, 100 - refL), 0, 1);       // highlights brighten less, so they do not burn out
+      let L = lab[0] + dL * (1 - 0.8 * hi), A = lab[1] + (tA - base.mean[1]) * 0.8, B = lab[2] + (tB - base.mean[2]);
+      let dc = Infinity; for (const c of contacts) dc = Math.min(dc, Math.abs(x - c));
+      if (dc < 3) L -= 6 * (1 - dc / 3);
+      lab2rgb(L, A, B, rgb);
+      for (let c = 0; c < 3; c++) out.data[k * 4 + c] = out.data[k * 4 + c] * (1 - a) + rgb[c] * a;
+    }
+    // ---- 8. lips stay on top: blend back the original outside the mouth opening
+    const ma = blurAlpha(Float32Array.from(mouthMask), w, h, 1);
+    for (let k = 0; k < w * h; k++) { const a = ma[k]; if (a >= 1) continue; for (let c = 0; c < 3; c++) out.data[k * 4 + c] = crop.data[k * 4 + c] * (1 - a) + out.data[k * 4 + c] * a; }
+    return { img: out, alpha: ma };
   }
 
   // typical colour of the dark mouth interior: the darkest fifth of the mouth pixels that are not teeth

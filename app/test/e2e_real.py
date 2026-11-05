@@ -1,7 +1,7 @@
 import asyncio, json, sys, subprocess, time, pathlib, shutil
 from playwright.async_api import async_playwright
 ROOT = pathlib.Path(__file__).resolve().parent; DIST = ROOT.parent.parent / 'docs'; OUT = pathlib.Path(sys.argv[1]); OUT.mkdir(parents=True, exist_ok=True)
-PHOTOS = sys.argv[2:] or ['/usr/local/lib/python3.13/site-packages/matplotlib/mpl-data/sample_data/grace_hopper.jpg']
+PHOTOS = [a for a in sys.argv[2:] if not a.startswith('--')] or ['/usr/local/lib/python3.13/site-packages/matplotlib/mpl-data/sample_data/grace_hopper.jpg']
 PORT = 8131
 async def main():
     srv = subprocess.Popen([sys.executable, '-m', 'http.server', str(PORT), '-d', str(DIST)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(0.8)
@@ -15,13 +15,13 @@ async def main():
             page = await ctx.new_page()
             page.on('console', lambda m: logs.append(f'[{m.type}] {m.text}') if m.type in ('error', 'warning') else None)
             page.on('pageerror', lambda e: logs.append(f'[pageerror] {e}'))
-            await page.goto(f'http://localhost:{PORT}/index.html')
+            await page.goto(f'http://localhost:{PORT}/index.html' + ('?cpu' if '--cpu' in sys.argv else ''))
             await page.get_by_text('فهمت').click()
             t0 = time.time()
             info = await page.evaluate('Engine.prepare().then(i => JSON.parse(JSON.stringify(i)))')
             res['prepare_s'] = round(time.time() - t0, 1); res['engine'] = info
             for n, photo in enumerate(PHOTOS):
-                await page.goto(f'http://localhost:{PORT}/index.html#/new'); await page.wait_for_timeout(300)
+                await page.goto(f'http://localhost:{PORT}/index.html' + ('?cpu' if '--cpu' in sys.argv else '') + '#/new'); await page.wait_for_timeout(300)
                 await page.fill('#pname', f'اختبار {n+1}'); await page.check('#consent')
                 async with page.expect_file_chooser() as fc:
                     await page.get_by_text('من المعرض').click()
@@ -34,7 +34,7 @@ async def main():
                 if gate:
                     r['gate_text'] = await page.inner_text('main')
                     await page.get_by_text('متابعة رغم ذلك').click()
-                    await page.wait_for_function("document.querySelector('.ba') || document.body.innerText.includes('تعذّر')", timeout=60000)
+                    await page.wait_for_function("document.querySelector('.ba') || document.body.innerText.includes('تعذّر') || document.body.innerText.includes('لا يمكن')", timeout=60000)
                 await page.wait_for_function("!document.querySelector('.ba .busy') || document.querySelector('.ba .busy').classList.contains('hidden')", timeout=60000)
                 await page.wait_for_timeout(500)
                 await page.screenshot(path=str(OUT / f'{n}_b_results.png'), full_page=True)
@@ -49,7 +49,7 @@ async def main():
                     await page.wait_for_timeout(200)
                     await page.wait_for_function("document.querySelector('.ba .busy').classList.contains('hidden')", timeout=30000)
                     r['resim_s'] = round(time.time() - t2, 2)
-                await page.locator('.ba').first.scroll_into_view_if_needed()
+                if await page.locator('.ba').count(): await page.locator('.ba').first.scroll_into_view_if_needed()
                 await page.screenshot(path=str(OUT / f'{n}_c_ba.png'))
                 res[f'photo{n}'] = r
             await br.close()

@@ -1,8 +1,8 @@
 /* Results: before/after on the patient's own photo, findings, simple design choices, review, approval, outputs */
 'use strict';
 const Results = { pending: null, live: null };
-const TREAT_LABEL = { veneer: 'فينير', crown: 'تاج', composite: 'كومبوزيت', implant: 'زرعة + تاج', pontic: 'جسر: سن معلّق', abutment: 'جسر: تاج داعم', none: 'بلا علاج' };
-const STATUS_LABEL = { present: 'موجود', missing: 'مفقود', hidden: 'غير ظاهر', unsure: 'غير واضح' };
+const TREAT_LABEL = { veneer: 'فينير', crown: 'تاج', composite: 'كومبوزيت', implant: 'زرعة + تاج', pontic: 'جسر: سن معلّق', abutment: 'جسر: تاج داعم', denture: 'طقم', none: 'بلا علاج' };
+const STATUS_LABEL = { present: 'موجود', estimated: 'تقديري', broken: 'مكسور', missing: 'مفقود', hidden: 'غير ظاهر', unsure: 'غير واضح' };
 const SHAPE_LABEL = { square: 'مربع', oval: 'بيضاوي', triangular: 'مثلث' };
 
 // view rectangles on the full photo: whole face, or the smile
@@ -131,7 +131,12 @@ async function viewResults(root, caseId) {
       const still = canvasOf(rects.face.w, rects.face.h); still.getContext('2d').drawImage(st.full, rects.face.x, rects.face.y, rects.face.w, rects.face.h, 0, 0, still.width, still.height);
       still.style.cssText = 'width:100%;border-radius:14px;display:block';
       main.replaceChildren(h('div', { class: 'mediawrap' }, still), h('div', { class: 'card' }, h('h2', null, 'لا يمكن تصميم هذه الصورة'),
-        h('p', { class: 'muted' }, 'لا تظهر الأسنان العلوية. التحليل والتصميم يحتاجان صورة ابتسامة عريضة تظهر فيها الأسنان.')),
+        h('p', { class: 'muted' }, 'لا تظهر الأسنان العلوية. التحليل والتصميم يحتاجان صورة ابتسامة عريضة تظهر فيها الأسنان.'),
+        h('details', { class: 'adv' }, h('summary', null, 'تفاصيل للمطوّر'), h('pre', { class: 'small', style: { whiteSpace: 'pre-wrap', direction: 'ltr', textAlign: 'left' } }, JSON.stringify({
+          engine: Engine.info.ep, fallback: Engine.info.fallback, selfTest: Engine.info.selfTest && { ep: Engine.info.selfTest.ep, ok: Engine.info.selfTest.ok }, segMs: st.segMs,
+          toothPixels: st.geom.labels ? Array.from({ length: 6 }, (_, i) => st.geom.labels.reduce((s, v) => s + (v === i + 1), 0)) : 'n/a',
+          rejected: st.sel.rejected, open: +(st.quality?.open || 0).toFixed(3), mouthW: Math.round(st.quality?.mouthW || 0), crop: [st.geom.crop.outW, st.geom.crop.outH], failed: (st.quality?.items || []).filter((i) => !i.ok).map((i) => i.id)
+        }, null, 1)))),
         actionbar(h('button', { class: 'btn primary grow', onclick: () => go('#/capture/' + c.id) }, '📷 التقاط صورة جديدة'), h('button', { class: 'btn', onclick: () => pickFromGallery(c.id) }, 'من المعرض')));
       return;
     }
@@ -194,7 +199,7 @@ function reviewTeeth(st, c, onDone) {
   svg.addEventListener('pointerup', () => { drag = null; });
   const statusBox = h('div');
   const drawStatus = () => statusBox.replaceChildren(h('div', { class: 'small muted', style: { margin: '10px 0 6px' } }, `السن ${sel}: ${C.TOOTH_NAME[sel]}`),
-    h('div', { class: 'chips' }, [['present', 'موجود'], ['missing', 'مفقود'], ['hidden', 'غير ظاهر']].map(([k, l]) => h('button', { class: 'chip' + (status[sel] === k ? ' on' : ''), onclick: () => { status[sel] = k; drawStatus(); draw(); } }, l))),
+    h('div', { class: 'chips' }, [['present', 'موجود'], ['broken', 'مكسور'], ['missing', 'مفقود'], ['hidden', 'غير ظاهر']].map(([k, l]) => h('button', { class: 'chip' + (status[sel] === k ? ' on' : ''), onclick: () => { status[sel] = k; drawStatus(); draw(); } }, l))),
     h('div', { class: 'chips', style: { marginTop: '8px' } }, C.TEETH.map((t) => h('button', { class: 'chip' + (t === sel ? ' on' : ''), onclick: () => { sel = t; drawStatus(); draw(); } }, t))));
   const bg = h('div', { class: 'modalbg' });
   const box = h('div', { class: 'modal' }, h('h2', null, 'مراجعة تحديد الأسنان'), h('p', { class: 'small muted' }, 'اضغط على السن، واسحب النقاط البيضاء لتصحيح حدوده: الجانبان عند نقاط التماس، والأعلى عند خط اللثة، والأسفل عند الحافة القاطعة.'),
@@ -202,7 +207,7 @@ function reviewTeeth(st, c, onDone) {
       const edited = c.toothMasksEdited || {};
       for (const t of C.TEETH) {
         const a = st.teeth[t], b = teeth[t], moved = Math.abs(a.x0 - b.x0) + Math.abs(a.x1 - b.x1) + Math.abs(a.y0 - b.y0) + Math.abs(a.y1 - b.y1) > 2;
-        if (status[t] !== 'present') { delete st.toothMasks[t]; delete edited[t]; }
+        if (status[t] !== 'present' && status[t] !== 'broken') { delete st.toothMasks[t]; delete edited[t]; }
         else if (moved || !st.toothMasks[t]) { st.toothMasks[t] = maskForBox(st, b); edited[t] = b; }
       }
       st.teeth = teeth; st.status = status; computeMeasures(st);

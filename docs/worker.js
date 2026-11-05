@@ -29,21 +29,30 @@ async function init(m) {
   self.ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, self.navigator.hardwareConcurrency || 2) : 1;
   self.ort.env.logLevel = 'error';
   const buf = await fetchCached(m.modelUrl, 'model');
-  modelBuf = buf; modelSize = m.size || 384;
+  modelBuf = buf; modelSize = m.size || 384; selfTest = m.selfTest || null;
   const tries = (m.webgpu !== false && self.navigator.gpu) ? ['webgpu', 'wasm'] : ['wasm'];
   let last = null;
   for (const e of tries) {
-    try { const t0 = performance.now(); await createSession(e); return { ep, warmMs: Math.round(performance.now() - t0), fallback: last ? String(last.message || last) : null }; }
+    try { const t0 = performance.now(); await createSession(e); return { ep, warmMs: Math.round(performance.now() - t0), fallback: last ? String(last.message || last) : null, selfTest: selfTestResult }; }
     catch (err) { last = err; session = null; }
   }
   throw last || new Error('تعذّر تشغيل النموذج');
 }
-let modelBuf = null, modelSize = 384;
+let modelBuf = null, modelSize = 384, selfTest = null, selfTestResult = null;
 // create a session on one execution provider and prove it works with a warm-up run (compiles GPU kernels)
 async function createSession(e) {
   const s = await self.ort.InferenceSession.create(modelBuf, { executionProviders: [e], graphOptimizationLevel: 'all' });
   const S = modelSize;
   await s.run({ [s.inputNames[0]]: new self.ort.Tensor('float32', new Float32Array(3 * S * S), [1, 3, S, S]) });
+  // self-test on a known tooth photo: some phone GPUs return wrong numbers without any error
+  if (selfTest) {
+    const out = (await s.run({ [s.inputNames[0]]: new self.ort.Tensor('float32', new Float32Array(selfTest.input), [1, 3, S, S]) }))[s.outputNames[0]].data;
+    const n = S * S, cnt = new Array(7).fill(0);
+    for (let i = 0; i < n; i++) { let b = 0, bv = out[i]; for (let c = 1; c < 7; c++) { const v = out[c * n + i]; if (v > bv) { bv = v; b = c; } } cnt[b]++; }
+    const ok = [1, 2, 3, 4, 5, 6].every((c) => Math.abs(cnt[c] - selfTest.expect[c]) <= 0.2 * selfTest.expect[c] + 50);
+    selfTestResult = { ep: e, ok, counts: cnt };
+    if (!ok) throw new Error('self-test failed on ' + e + ': ' + cnt.join(','));
+  }
   session = s; ep = e;
 }
 
@@ -113,6 +122,7 @@ self.onmessage = async (e) => {
   try {
     if (m.type === 'init') post({ type: 'ready', id: m.id, ...(await init(m)) });
     else if (m.type === 'segment') { const r = await segment(m); post({ type: 'segmented', id: m.id, ...r }, [r.labels.buffer, r.conf.buffer]); }
+    else if (m.type === 'cpu') { await createSession('wasm'); post({ type: 'ok', id: m.id, ep }); }
     else if (m.type === 'library') { library = buildLibrary(m.items); post({ type: 'ok', id: m.id }); }
     else if (m.type === 'simInit') {
       const toothMasks = {}; for (const [t, b] of Object.entries(m.toothMasks)) toothMasks[t] = new Uint8Array(b);

@@ -171,7 +171,7 @@ function serializeAnalysis(st) {
     P: Float32Array.from(g.P.flatMap((p) => [p.x, p.y])), fullW: g.fullW, fullH: g.fullH, turns: g.turns, faces: g.faces,
     crop: { M: g.crop.M, Minv: g.crop.Minv, outW: g.crop.outW, outH: g.crop.outH, scale: g.crop.scale, roll: g.crop.roll },
     clean: g.clean, selTeeth: st.sel.teeth, orderOk: st.sel.orderOk, meanConf: st.sel.meanConf, info: st.sel.info,
-    teeth: st.teeth, status: st.status, quality: { ok: st.quality.ok, items: st.quality.items, pose: st.quality.pose }, timings: st.timings, segMs: st.segMs, ep: st.ep, at: Date.now()
+    teeth: st.teeth, status: st.status, edentulous: st.edentulous, quality: { ok: st.quality.ok, items: st.quality.items, pose: st.quality.pose }, timings: st.timings, segMs: st.segMs, ep: st.ep, at: Date.now()
   };
 }
 async function restoreState(c) {
@@ -182,7 +182,7 @@ async function restoreState(c) {
   const crop = { ...a.crop };
   const geom = { P, crop, lips: lipsInCrop(P, crop), clean: a.clean, turns: a.turns, fullW: a.fullW, fullH: a.fullH, faces: a.faces };
   const fullImg = full.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, full.width, full.height);
-  const st = buildState(full, fullImg, cropCanvasFrom(full, crop), geom, S, { teeth: a.teeth, selTeeth: a.selTeeth, status: a.status, orderOk: a.orderOk, meanConf: a.meanConf, info: a.info });
+  const st = buildState(full, fullImg, cropCanvasFrom(full, crop), geom, S, { teeth: a.teeth, selTeeth: a.selTeeth, status: a.status, orderOk: a.orderOk, meanConf: a.meanConf, info: a.info, edentulous: a.edentulous });
   if (c.toothMasksEdited) for (const [t, box] of Object.entries(c.toothMasksEdited)) st.toothMasks[t] = maskForBox(st, box);
   st.quality = a.quality; st.timings = a.timings; st.segMs = a.segMs; st.ep = a.ep; st.caliperMm = c.caliperMm || null; st.broken = c.broken || {};
   if (st.caliperMm) computeMeasures(st);

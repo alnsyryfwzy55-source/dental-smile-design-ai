@@ -73,12 +73,22 @@ ok('selectUpperTeeth keeps upper teeth and rejects lower teeth mislabelled as up
 });
 ok('classifyAbsent: gap → missing, canine out of view → hidden', () => {
   const f = face(); const t = require('./synth.js').defaultTeeth(f); delete t['12'];
-  const img = render(f, { teeth: t }); const cr = S.mouthCrop(f.P); const crop = Sim.warpAffine(img, cr.M, cr.outW, cr.outH);
+  const shown = Object.assign({}, t); delete shown['23'];          // canine really not in the picture
+  const img = render(f, { teeth: shown }); const cr = S.mouthCrop(f.P); const crop = Sim.warpAffine(img, cr.M, cr.outW, cr.outH);
   const toC = (p) => S.applyAffine(cr.Minv, p); const teethC = {};
   for (const [k, b] of Object.entries(t)) { const p0 = toC({ x: b.x0, y: b.y0 }), p1 = toC({ x: b.x1, y: b.y1 }); teethC[k] = { x0: p0.x, y0: p0.y, x1: p1.x, y1: p1.y }; }
   delete teethC['23'];
   const st = S.classifyAbsent({ teeth: teethC }, crop.data, crop.w, crop.h);
   assert.strictEqual(st['12'], 'missing'); assert.strictEqual(st['23'], 'hidden');
+});
+ok('classifyAbsent: canine visible but not labelled → estimated', () => {
+  const f = face(); const t = require('./synth.js').defaultTeeth(f);
+  const img = render(f, { teeth: t }); const cr = S.mouthCrop(f.P); const crop = Sim.warpAffine(img, cr.M, cr.outW, cr.outH);
+  const toC = (p) => S.applyAffine(cr.Minv, p); const teethC = {};
+  for (const [k, b] of Object.entries(t)) { const p0 = toC({ x: b.x0, y: b.y0 }), p1 = toC({ x: b.x1, y: b.y1 }); teethC[k] = { x0: p0.x, y0: p0.y, x1: p1.x, y1: p1.y }; }
+  delete teethC['23'];
+  const st = S.classifyAbsent({ teeth: teethC }, crop.data, crop.w, crop.h);
+  assert.strictEqual(st['23'], 'estimated');
 });
 ok('smile arc: incisal edges follow a rising lower lip, centrals stay longest', () => {
   const T = require('./synth.js').defaultTeeth(face());
@@ -131,3 +141,81 @@ ok('simulate: lips/skin untouched, treated teeth whiter, gap closed', () => {
   module.exports.last = { crop, r, w, h };
 });
 console.log(`\n${pass} passed`);
+
+// ---------- trauma cases ----------
+const synth = require('./synth.js');
+function cropAndMasks(f, teeth, opts = {}) {
+  const img = synth.render(f, { teeth }); const cr = S.mouthCrop(f.P); const crop = Sim.warpAffine(img, cr.M, cr.outW, cr.outH);
+  const toC = (p) => S.applyAffine(cr.Minv, p), w = crop.w, h = crop.h, cur = {}, masks = {};
+  for (const [k, b] of Object.entries(teeth)) { const p0 = toC({ x: b.x0, y: b.y0 }), p1 = toC({ x: b.x1, y: b.y1 }); cur[k] = { x0: p0.x, y0: p0.y, x1: p1.x, y1: p1.y };
+    const m = new Uint8Array(w * h); for (let y = Math.ceil(p0.y); y <= Math.floor(p1.y); y++) for (let x = Math.ceil(p0.x); x <= Math.floor(p1.x); x++) m[y * w + x] = 1; masks[k] = m; }
+  const lips = { upper: S.INNER_UPPER.map((i) => toC(f.P[i])), lower: S.INNER_LOWER.map((i) => toC(f.P[i])), poly: S.innerLipPolygon(f.P).map(toC) };
+  return { crop, cur, masks, lips, mouth: S.rasterPoly(lips.poly, w, h), w, h, toC, cr };
+}
+function fakeLibrary() {
+  const lib = {};
+  for (const t of C.TEETH) { const w = 40, h = 60, img = Sim.makeImg(w, h), m = new Uint8Array(w * h).fill(1);
+    for (let k = 0; k < w * h; k++) { const n = ((k * 7919) % 13) - 6; img.data[k * 4] = 232 + n; img.data[k * 4 + 1] = 222 + n; img.data[k * 4 + 2] = 196 + n; img.data[k * 4 + 3] = 255; }
+    lib[t] = { img, mask: m, stats: Sim.labStats(img, m) }; }
+  return lib;
+}
+const meanL = (im, b, w) => { const lab = [0, 0, 0]; let s = 0, n = 0; for (let y = Math.ceil(b.y0 + 0.25 * (b.y1 - b.y0)); y < b.y1 - 0.2 * (b.y1 - b.y0); y++) for (let x = Math.ceil(b.x0 + 3); x < b.x1 - 3; x++) { const i = (y * w + x) * 4; Sim.rgb2lab(im.data[i], im.data[i + 1], im.data[i + 2], lab); s += lab[0]; n++; } return s / n; };
+
+ok('lost tooth over pink healed gum is classified missing (not unsure)', () => {
+  const f = face(); const t = synth.defaultTeeth(f); const lost = t['21']; delete t['21'];
+  const r = cropAndMasks(f, t); const p0 = r.toC({ x: lost.x0, y: lost.y0 }), p1 = r.toC({ x: lost.x1, y: lost.y1 });
+  for (let y = Math.round(p0.y); y <= Math.round(p1.y); y++) for (let x = Math.round(p0.x); x <= Math.round(p1.x); x++) { const i = (y * r.w + x) * 4; r.crop.data[i] = 205; r.crop.data[i + 1] = 120; r.crop.data[i + 2] = 125; }
+  const st = S.classifyAbsent({ teeth: r.cur }, r.crop.data, r.w, r.h);
+  assert.strictEqual(st['21'], 'missing');
+});
+ok('fractured incisor detected from its counterpart and from W/L', () => {
+  const T = synth.defaultTeeth(face()); const st = Object.fromEntries(C.TEETH.map((k) => [k, 'present']));
+  T['21'].y1 = T['21'].y0 + (T['21'].y1 - T['21'].y0) * 0.55;
+  assert.deepStrictEqual(S.detectBroken(T, st), ['21']);
+  const T2 = synth.defaultTeeth(face()); for (const k of ['11', '21']) T2[k].y1 = T2[k].y0 + (T2[k].x1 - T2[k].x0) / 1.6;
+  assert.deepStrictEqual(S.detectBroken(T2, st).sort(), ['11', '21']);
+  assert.deepStrictEqual(S.detectBroken(synth.defaultTeeth(face()), st), [], 'healthy arch: none');
+});
+ok('rebuilding a missing/broken tooth is not capped by the change limits', () => {
+  const cur = { '11': { x0: 0, x1: 85, y0: 0, y1: 40 } }, tgt = { '11': { x0: 0, x1: 85, y0: 0, y1: 105 } };
+  assert(S.limitChanges(cur, tgt, 0.1, {}, { '11': 'present' })['11'].y1 <= 40 + 25 + 1e-9);
+  assert.strictEqual(S.limitChanges(cur, tgt, 0.1, {}, { '11': 'broken' })['11'].y1, 105);
+});
+ok('no front teeth: an ideal set is designed from the face (midline, mm scale, order)', () => {
+  const f = face(); const r = cropAndMasks(f, {});
+  const midX = r.w / 2 + 6, T = S.designFromFace(r.lips, midX, 0.1);
+  near((T['11'].x1 + T['21'].x0) / 2, midX, 1e-6, 'on the facial midline');
+  near(T['11'].x1 - T['11'].x0, 86, 1e-6, '8.6 mm at 0.1 mm/px');
+  for (let i = 1; i < 6; i++) assert(T[C.TEETH[i]].x0 >= T[C.TEETH[i - 1]].x1 - 1e-6, 'order');
+  assert(T['11'].y1 - T['11'].y0 > T['12'].y1 - T['12'].y0, 'centrals longest');
+});
+function trauma(teeth, statusOver, opts = {}) {
+  const f = face(); const r = cropAndMasks(f, teeth);
+  const mm = S.irisMmPerPx(f.P) * r.cr.scale;
+  let cur = r.cur, status;
+  if (opts.edentulous) { cur = S.designFromFace(r.lips, r.w / 2, mm); status = Object.fromEntries(C.TEETH.map((k) => [k, 'missing'])); }
+  else { status = Object.fromEntries(C.TEETH.map((k) => [k, statusOver[k] || 'present'])); cur = C.fillMissing(Object.fromEntries(Object.entries(cur).filter(([k]) => status[k] !== 'missing')), r.w, r.h).teeth; }
+  const masks = {}; for (const k of C.TEETH) if (r.masks[k] && status[k] !== 'missing') masks[k] = r.masks[k];
+  const mStatus = Object.fromEntries(C.TEETH.map((k) => [k, status[k] === 'present' ? 'present' : status[k] === 'broken' ? 'broken' : 'missing']));
+  const meas = C.measure(cur, mm, mStatus), d = C.proposeDesign(cur, meas, C.DEFAULT_RULES, { proportion: 'red70' });
+  const target = S.limitChanges(cur, S.applySmileArc(d.target, (x) => S.chainY(r.lips.lower, x), mm), mm, {}, status);
+  const treat = Object.fromEntries(C.TEETH.map((k) => [k, status[k] === 'missing' ? 'implant' : status[k] === 'broken' ? 'crown' : 'veneer']));
+  const out = Sim.simulate({ crop: r.crop, mouthMask: r.mouth, toothMasks: masks, current: cur, target, treat, status, shape: 'oval', shadeHex: '#F0E9D8', whiten: 1, library: fakeLibrary() });
+  return { ...r, out, target, status };
+}
+ok('simulation fills lost teeth (mirror tooth / library) and rebuilds a broken tooth in full', () => {
+  const f = face(); const t = synth.defaultTeeth(f); delete t['11']; delete t['12'];      // two lost teeth
+  t['21'].y1 = t['21'].y0 + (t['21'].y1 - t['21'].y0) * 0.5;                              // and a fractured 21
+  const r = trauma(t, { '11': 'missing', '12': 'missing', '21': 'broken' });
+  for (const k of ['11', '12', '21']) { const L = meanL(r.out.img, r.target[k], r.w); assert(L > 75, `${k} drawn as tooth, L*=${L.toFixed(1)}`); }
+  const tb = r.target['21']; assert(tb.y1 - tb.y0 > 0.9 * (r.target['11'].y1 - r.target['11'].y0), 'broken 21 rebuilt to full length');
+  let changedOutside = 0; for (let k = 0; k < r.w * r.h; k++) if (r.out.alpha[k] === 0 && r.out.img.data[k * 4] !== r.crop.data[k * 4]) changedOutside++;
+  assert.strictEqual(changedOutside, 0, 'lips untouched');
+  module.exports.trauma1 = r;
+});
+ok('simulation of a mouth with no front teeth at all', () => {
+  const r = trauma({}, {}, { edentulous: true });
+  for (const k of ['11', '21', '12', '22']) assert(meanL(r.out.img, r.target[k], r.w) > 75, k + ' drawn');
+  module.exports.trauma2 = r;
+});
+console.log(`\n${pass} passed (with trauma cases)`);

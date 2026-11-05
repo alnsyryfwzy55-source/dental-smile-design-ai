@@ -45,8 +45,14 @@ const Engine = {
       const model = (async () => {
         if (window.__DSD_TEST_SEGMENT) { onStatus({ key: 'model', state: 'done' }); return; }
         onStatus({ key: 'model', state: 'loading' });
-        const r = await this.call('init', { ortUrl: ortBase + 'ort.webgpu.min.js', ortBase, modelUrl: new URL(MODEL_URL, location.href).href, size: MODEL_SIZE });
-        this.info.ep = r.ep; this.info.warmMs = r.warmMs; onStatus({ key: 'model', state: 'done' });
+        let selfTest = null;
+        try {
+          const [b, expect] = await Promise.all([fetch('selftest.jpg').then((r) => r.blob()), fetch('selftest.json').then((r) => r.json())]);
+          const bmp = await createImageBitmap(b), c = canvasOf(bmp.width, bmp.height); c.getContext('2d').drawImage(bmp, 0, 0);
+          selfTest = { input: modelInput(c).buffer, expect };
+        } catch (e) { console.warn('self-test asset missing', e); }
+        const r = await this.call('init', { selfTest, ortUrl: ortBase + 'ort.webgpu.min.js', ortBase, modelUrl: new URL(MODEL_URL, location.href).href, size: MODEL_SIZE, webgpu: !/[?&]cpu\b/.test(location.search) });
+        this.info.ep = r.ep; this.info.warmMs = r.warmMs; this.info.fallback = r.fallback; this.info.selfTest = r.selfTest; onStatus({ key: 'model', state: 'done' });
       })();
       const face = (async () => {
         onStatus({ key: 'face', state: 'loading' });
@@ -98,7 +104,8 @@ const Engine = {
 
   async segment(input) {
     if (window.__DSD_TEST_SEGMENT) return window.__DSD_TEST_SEGMENT(input, MODEL_SIZE);
-    const r = await this.call('segment', { input, size: MODEL_SIZE, tta: true }, [input.buffer]);
+    // flip-TTA doubles the time for ~+0.004 Dice: use it only when the GPU engine is running
+    const r = await this.call('segment', { input, size: MODEL_SIZE, tta: this.info.ep === 'webgpu' }, [input.buffer]);
     return r;
   }
 };
@@ -184,7 +191,14 @@ async function analyzePhoto(blob, settings, onStep = () => {}) {
   onStep('mouth');
   const crop = SM.mouthCrop(P), cropC = cropCanvasFrom(full, crop), lips = lipsInCrop(P, crop); mark('mouth');
   onStep('teeth');
-  const seg = await Engine.segment(modelInput(cropC)); mark('teeth');
+  let seg = await Engine.segment(modelInput(cropC)); mark('teeth');
+  // second safeguard: the GPU found nothing in an open mouth → check on the CPU engine; if the CPU sees teeth, keep using it
+  const toothPx = (l) => { let n = 0; for (let i = 0; i < l.length; i++) if (l[i]) n++; return n; };
+  if (!window.__DSD_TEST_SEGMENT && Engine.info.ep === 'webgpu' && mouthOpen(P) && toothPx(seg.labels) < 0.01 * seg.labels.length) {
+    await Engine.call('cpu');
+    const seg2 = await Engine.segment(modelInput(cropC));
+    if (toothPx(seg2.labels) > toothPx(seg.labels)) { seg = seg2; Engine.info.ep = 'wasm'; Engine.info.fallback = 'GPU found no teeth; switched to CPU'; }
+  }
   const geom = { P, crop, lips, labels: seg.labels, conf: seg.conf, turns, fullW: full.width, fullH: full.height, faces };
   const st = buildState(full, fullImg, cropC, geom, settings);
   st.quality = quality; st.stats = stats; st.timings = T; st.segMs = seg.ms; st.ep = seg.ep || Engine.info.ep;
@@ -202,17 +216,33 @@ function buildState(full, fullImg, cropC, geom, settings, saved = {}) {
     sel = SM.selectUpperTeeth(geom.labels, geom.conf || null, S, w, h, lips, { rgba: cropImg.data });
     geom.clean = sel.clean;
   }
-  const absent = saved.status ? null : SM.classifyAbsent(sel, cropImg.data, w, h, lips);
-  const status = saved.status || Object.fromEntries(C.TEETH.map((t) => [t, sel.teeth[t] ? 'present' : absent[t]]));
-  const teeth = saved.teeth || C.fillMissing(sel.teeth, w, h).teeth;
+  let status, teeth, edentulous = !!saved.edentulous;
+  if (saved.status) { status = saved.status; teeth = saved.teeth; }
+  else if (!Object.keys(sel.teeth).length && mouthOpen(P)) {
+    // no front teeth visible but the mouth is open: design a full anterior set from the face (trauma / extraction cases)
+    edentulous = true;
+    teeth = SM.designFromFace(lips, facialMidX(P, crop, lips), SM.irisMmPerPx(P) ? SM.irisMmPerPx(P) * crop.scale : null);
+    status = Object.fromEntries(C.TEETH.map((t) => [t, 'missing']));
+  } else {
+    const absent = SM.classifyAbsent(sel, cropImg.data, w, h, lips);
+    status = Object.fromEntries(C.TEETH.map((t) => [t, sel.teeth[t] ? 'present' : absent[t]]));
+    teeth = C.fillMissing(sel.teeth, w, h).teeth;
+    for (const t of SM.detectBroken(teeth, status)) status[t] = 'broken';
+  }
   const toothMasks = masksFromLabels(geom.clean, S, w, h);
-  for (const t of C.TEETH) if (status[t] !== 'present') delete toothMasks[t];
+  for (const t of C.TEETH) if (status[t] !== 'present' && status[t] !== 'broken') delete toothMasks[t];
   const mouthMask = SM.rasterPoly(lips.poly, w, h);
-  const st = { full, fullImg, cropC, cropImg, geom, sel, status, teeth, toothMasks, mouthMask, settings };
+  const st = { full, fullImg, cropC, cropImg, geom, sel, status, teeth, toothMasks, mouthMask, settings, edentulous };
   computeMeasures(st);
   return st;
 }
 
+const mouthOpen = (P) => Math.hypot(P[13].x - P[14].x, P[13].y - P[14].y) / Math.max(1, Math.hypot(P[61].x - P[291].x, P[61].y - P[291].y)) >= 0.06;
+function facialMidX(P, crop, lips) {
+  const g = SM.applyAffine(crop.Minv, P[SM.LM.glabella]), m = SM.applyAffine(crop.Minv, P[SM.LM.menton]);
+  const y = lips.upper.reduce((s, p) => s + p.y, 0) / lips.upper.length;
+  return g.x + (m.x - g.x) * (y - g.y) / ((m.y - g.y) || 1);
+}
 function computeMeasures(st) {
   const { geom, teeth, status } = st, { P, crop } = geom, settings = st.settings;
   const iris = SM.irisMmPerPx(P);
@@ -220,7 +250,7 @@ function computeMeasures(st) {
   st.mmppCrop = cal || (iris ? iris * crop.scale : null);
   st.mmppImg = st.mmppCrop ? st.mmppCrop / crop.scale : null;
   st.scaleSource = cal ? 'caliper' : iris ? 'iris' : null;
-  const mStatus = {}; for (const t of C.TEETH) mStatus[t] = status[t] === 'present' ? (st.broken?.[t] ? 'broken' : 'present') : 'missing';
+  const mStatus = {}; for (const t of C.TEETH) mStatus[t] = status[t] === 'present' ? 'present' : status[t] === 'broken' ? 'broken' : 'missing';   // 'estimated' boxes are not measured
   st.meas = C.measure(teeth, st.mmppCrop, mStatus);
   const ext = SM.dentitionExtent(st.cropImg.data, crop.outW, crop.outH, st.mouthMask);
   const pts = SM.facePoints(P, Object.fromEntries(C.TEETH.filter((t) => status[t] === 'present').map((t) => [t, teeth[t]])), crop.M, ext);
@@ -245,9 +275,9 @@ function computeDesign(st, d) {
   if (!prop.ok) return { ok: false, error: prop.error };
   const lower = (x) => SM.chainY(lips.lower, x);
   let target = SM.applySmileArc(prop.target, lower, st.mmppCrop, { lengthDeltaMm: d.lengthMm });
-  target = SM.limitChanges(teeth, target, st.mmppCrop, { shortenMm: 1.5 + Math.max(0, -d.lengthMm), lengthenMm: 2.5 + Math.max(0, d.lengthMm) });
+  target = SM.limitChanges(teeth, target, st.mmppCrop, { shortenMm: 1.5 + Math.max(0, -d.lengthMm), lengthenMm: 2.5 + Math.max(0, d.lengthMm) }, status);
   const treat = {};
-  for (const t of C.TEETH) treat[t] = d.treat?.[t] || (status[t] === 'missing' ? 'implant' : status[t] === 'hidden' ? 'none' : 'veneer');
+  for (const t of C.TEETH) treat[t] = d.treat?.[t] || (status[t] === 'missing' ? 'implant' : status[t] === 'broken' ? 'crown' : status[t] === 'hidden' ? 'none' : 'veneer');
   const mStatus = {}; for (const t of C.TEETH) mStatus[t] = treat[t] === 'none' && status[t] !== 'present' ? 'missing' : 'present';
   const measAfter = C.measure(target, st.mmppCrop, mStatus);
   const pP = C.PROPORTIONS[d.proportion]?.p ?? 0.7;
@@ -292,15 +322,20 @@ function findings(st, design) {
   return out;
 }
 
-const noTeeth = (st) => !C.TEETH.some((t) => st.status[t] === 'present');
+const noTeeth = (st) => !st.edentulous && !C.TEETH.some((t) => st.status[t] === 'present' || st.status[t] === 'broken' || st.status[t] === 'missing');
 // Problems the doctor must look at before approving (detection, not design)
 function detectionIssues(st) {
   const out = [];
   if (noTeeth(st)) return [{ level: 'fail', text: 'لا تظهر الأسنان العلوية في الصورة. صوّر المريض وهو يبتسم ابتسامة عريضة تُظهر أسنانه.', retake: true }];
-  const missing = C.TEETH.filter((t) => st.status[t] === 'missing'), unsure = C.TEETH.filter((t) => st.status[t] === 'unsure'), hidden = C.TEETH.filter((t) => st.status[t] === 'hidden');
+  if (st.edentulous) out.push({ level: 'warn', text: 'لا تظهر أسنان أمامية: صُمّمت أسنان كاملة على مقاييس الوجه (خط الوسط وعرض الفم). راجع مواضعها.', needsReview: true });
+  const broken = C.TEETH.filter((t) => st.status[t] === 'broken');
+  if (broken.length) out.push({ level: 'warn', text: `أسنان تبدو مكسورة: ${broken.join('، ')} — ستُبنى كاملة. تأكد منها.`, needsReview: true });
+  const missing = st.edentulous ? [] : C.TEETH.filter((t) => st.status[t] === 'missing'), unsure = C.TEETH.filter((t) => st.status[t] === 'unsure'), hidden = C.TEETH.filter((t) => st.status[t] === 'hidden');
   if (missing.length) out.push({ level: 'warn', text: `أسنان تبدو مفقودة: ${missing.join('، ')} — تأكد منها.`, needsReview: true });
   if (unsure.length) out.push({ level: 'fail', text: `لم يتضح تحديد: ${unsure.join('، ')} — راجع التحديد.`, needsReview: true });
   if (hidden.length) out.push({ level: 'info', text: `غير ظاهرة في الابتسامة: ${hidden.join('، ')} (لن تُعدَّل في المحاكاة).` });
+  const est = C.TEETH.filter((t) => st.status[t] === 'estimated');
+  if (est.length) out.push({ level: 'info', text: `حُدّد تقديرياً: ${est.join('، ')} (ظاهر لكن لم يُقَس). يمكنك تصحيح حدوده في المراجعة.` });
   if (st.sel && st.sel.orderOk === false) out.push({ level: 'fail', text: 'ترتيب الأسنان المكتشفة غير منطقي — راجع التحديد.', needsReview: true });
   if (st.sel && st.sel.meanConf && st.sel.meanConf < 0.85) out.push({ level: 'warn', text: `ثقة الكشف منخفضة (${st.sel.meanConf.toFixed(2)}) — راجع التحديد.`, needsReview: true });
   if (!st.mmppCrop) out.push({ level: 'warn', text: 'تعذّر تقدير المقياس بالملم من العين.' });
