@@ -1,0 +1,389 @@
+/* Smile-photo analysis: pure functions on landmarks, label maps and pixel arrays (no DOM). Browser: window.DSDSmile, Node: module.exports */
+(function (root) {
+  'use strict';
+  const C = root.DSDCore || (typeof require !== 'undefined' ? require('./core.js') : null);
+  const TEETH = C.TEETH;
+
+  // MediaPipe Face Landmarker (478 points) indices
+  const LM = {
+    irisA: 468, irisB: 473, ringA: [469, 470, 471, 472], ringB: [474, 475, 476, 477],
+    eyeA_out: 33, eyeA_in: 133, eyeB_in: 362, eyeB_out: 263,
+    forehead: 10, glabella: 9, nasion: 168, noseTip: 1, subnasale: 2, menton: 152, edgeA: 234, edgeB: 454,
+    commA: 61, commB: 291, upperInner: 13, lowerInner: 14
+  };
+  const INNER_UPPER = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308];   // corner → corner along upper lip
+  const INNER_LOWER = [308, 324, 318, 402, 317, 14, 87, 178, 88, 95, 78];   // corner → corner along lower lip
+  const OUTER_LIP = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146];
+  const IRIS_MM = 11.7;            // mean horizontal visible iris diameter in adults
+
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const deg = (r) => r * 180 / Math.PI;
+
+  function toPx(lm, W, H) { return lm.map((p) => ({ x: p.x * W, y: p.y * H })); }
+
+  // Upright test: eyes must be above the mouth. Returns 0 if upright, else the quarter turns (k*90° clockwise) that fix it.
+  function uprightTurns(P) {
+    const eyes = mid(P[LM.irisA] || P[LM.eyeA_out], P[LM.irisB] || P[LM.eyeB_out]);
+    const mouth = mid(P[LM.upperInner], P[LM.lowerInner]);
+    const dx = mouth.x - eyes.x, dy = mouth.y - eyes.y;      // vector eyes → mouth should point down (+y)
+    const a = deg(Math.atan2(dx, dy));                       // 0 = down
+    if (Math.abs(a) <= 45) return 0;
+    if (a > 45 && a <= 135) return 1;      // mouth to the right of eyes → rotate 90° clockwise
+    if (a < -45 && a >= -135) return 3;
+    return 2;
+  }
+
+  function eyes(P) {
+    let a = P[LM.irisA], b = P[LM.irisB];
+    if (!a || !b) { a = mid(P[LM.eyeA_out], P[LM.eyeA_in]); b = mid(P[LM.eyeB_in], P[LM.eyeB_out]); }
+    return a.x <= b.x ? [a, b] : [b, a];         // [image-left (patient right), image-right]
+  }
+
+  function pose(P) {
+    const [eR, eL] = eyes(P);
+    const roll = deg(Math.atan2(eL.y - eR.y, eL.x - eR.x));
+    const r = -roll * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r), o = eR;
+    const T = (p) => ({ x: o.x + (p.x - o.x) * cs - (p.y - o.y) * sn, y: o.y + (p.x - o.x) * sn + (p.y - o.y) * cs });
+    const nose = T(P[LM.noseTip]), a = T(P[LM.edgeA]), b = T(P[LM.edgeB]);
+    const left = a.x < b.x ? a : b, right = a.x < b.x ? b : a;
+    const dl = Math.abs(nose.x - left.x), dr = Math.abs(right.x - nose.x);
+    const yaw = (dl - dr) / Math.max(1, dl + dr);                 // 0 = frontal; ± = turned
+    const em = T(mid(eR, eL)), chin = T(P[LM.menton]);
+    const pitch = (nose.y - em.y) / Math.max(1, chin.y - em.y);   // ~0.35–0.5 when frontal
+    return { roll, yaw, pitch };
+  }
+
+  function innerLipPolygon(P) { return INNER_UPPER.map((i) => P[i]).concat(INNER_LOWER.slice(1, -1).map((i) => P[i])); }
+
+  // Pixel statistics needed by the capture quality checks. rgba: Uint8ClampedArray, W×H.
+  function imageStats(rgba, W, H, P, opts = {}) {
+    const inner = innerLipPolygon(P);
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of inner) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+    x0 = Math.max(0, Math.floor(x0)); y0 = Math.max(0, Math.floor(y0)); x1 = Math.min(W - 1, Math.ceil(x1)); y1 = Math.min(H - 1, Math.ceil(y1));
+    const step = Math.max(1, Math.round((x1 - x0) / 220));
+    let n = 0, bright = 0, clip = 0; const Ls = [];
+    for (let y = y0; y <= y1; y += step) for (let x = x0; x <= x1; x += step) {
+      if (!pointInPoly(x, y, inner)) continue;
+      const i = (y * W + x) * 4, r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+      const L = 0.299 * r + 0.587 * g + 0.114 * b; Ls.push(L);
+      n++; if (L > 140 && (mx - mn) < 75) bright++; if (mx >= 250) clip++;
+    }
+    // face brightness: box between the eyes and the mouth (or supplied by the caller)
+    let fs = 0, fn = 0;
+    if (opts.faceL != null) { fs = opts.faceL; fn = 1; } else {
+      const [eR, eL] = eyes(P), m = mid(P[LM.upperInner], P[LM.lowerInner]);
+      const fx0 = Math.round(Math.min(eR.x, eL.x)), fx1 = Math.round(Math.max(eR.x, eL.x)), fy0 = Math.round(Math.min(eR.y, eL.y)), fy1 = Math.round(m.y);
+      const fstep = Math.max(1, Math.round((fx1 - fx0) / 60));
+      for (let y = Math.max(0, fy0); y <= Math.min(H - 1, fy1); y += fstep) for (let x = Math.max(0, fx0); x <= Math.min(W - 1, fx1); x += fstep) {
+        const i = (y * W + x) * 4; fs += 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2]; fn++;
+      }
+    }
+    // sharpness: variance of the Laplacian over the mouth box, on a ~256px-wide grid
+    const sw = Math.max(1, (x1 - x0) / 256);
+    const gw = Math.max(3, Math.floor((x1 - x0) / sw)), gh = Math.max(3, Math.floor((y1 - y0) / sw));
+    const G = new Float32Array(gw * gh);
+    for (let j = 0; j < gh; j++) for (let k = 0; k < gw; k++) {
+      const x = Math.min(W - 1, Math.round(x0 + k * sw)), y = Math.min(H - 1, Math.round(y0 + j * sw)), i = (y * W + x) * 4;
+      G[j * gw + k] = 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2];
+    }
+    let ls = 0, ls2 = 0, ln = 0;
+    for (let j = 1; j < gh - 1; j++) for (let k = 1; k < gw - 1; k++) {
+      const v = 4 * G[j * gw + k] - G[j * gw + k - 1] - G[j * gw + k + 1] - G[(j - 1) * gw + k] - G[(j + 1) * gw + k];
+      ls += v; ls2 += v * v; ln++;
+    }
+    const lapVar = ln ? ls2 / ln - (ls / ln) ** 2 : 0;
+    return { teethFrac: n ? bright / n : 0, clipFrac: n ? clip / n : 0, faceL: fn ? fs / fn : 0, sharpness: lapVar, mouthPx: { w: x1 - x0, h: y1 - y0 } };
+  }
+
+  const QUALITY_DEFAULTS = { maxRoll: 4, maxYaw: 0.10, pitchMin: 0.22, pitchMax: 0.60, minMouthW: 200, faceMin: 0.30, faceMax: 0.92,
+    minOpen: 0.10, minTeeth: 0.20, minL: 70, maxL: 225, maxClip: 0.25, minSharp: 40, maxCenterOff: 0.22 };
+
+  // P: landmarks in px; stats: imageStats(); returns { ok, items: [{id, ok, label, hint}] }
+  function qualityChecks(P, W, H, stats, th = {}) {
+    const t = Object.assign({}, QUALITY_DEFAULTS, th);
+    const ps = pose(P), items = [];
+    const faceH = dist(P[LM.forehead], P[LM.menton]) * 1.12;
+    const fc = mid(P[LM.forehead], P[LM.menton]);
+    const mouthW = dist(P[LM.commA], P[LM.commB]);
+    const open = dist(P[LM.upperInner], P[LM.lowerInner]) / Math.max(1, mouthW);
+    const add = (id, ok, label, hint) => items.push({ id, ok, label, hint: ok ? '' : hint });
+    const rel = faceH / H;
+    add('distance', rel >= t.faceMin && rel <= t.faceMax && mouthW >= t.minMouthW, 'المسافة',
+      rel < t.faceMin ? 'قرّب الكاميرا من المريض' : rel > t.faceMax ? 'ابتعد قليلاً: الوجه كله يجب أن يظهر' : 'دقة الصورة منخفضة: استخدم الكاميرا الخلفية واقترب قليلاً');
+    const off = Math.max(Math.abs(fc.x / W - 0.5), Math.abs(fc.y / H - 0.5));
+    add('center', off <= t.maxCenterOff, 'التوسيط', 'اجعل الوجه في منتصف الصورة');
+    add('roll', Math.abs(ps.roll) <= t.maxRoll, 'استقامة الرأس', ps.roll > 0 ? 'الرأس مائل: اطلب من المريض إمالته قليلاً إلى اليسار' : 'الرأس مائل: اطلب من المريض إمالته قليلاً إلى اليمين');
+    add('frontal', Math.abs(ps.yaw) <= t.maxYaw && ps.pitch >= t.pitchMin && ps.pitch <= t.pitchMax, 'النظر للأمام',
+      Math.abs(ps.yaw) > t.maxYaw ? 'المريض ملتفت: يجب أن ينظر مباشرة إلى الكاميرا' : (ps.pitch < t.pitchMin ? 'الرأس مرفوع: اطلب خفض الذقن قليلاً' : 'الرأس منخفض: اطلب رفع الذقن قليلاً'));
+    add('smile', open >= t.minOpen && stats.teethFrac >= t.minTeeth, 'ابتسامة تُظهر الأسنان', 'اطلب ابتسامة عريضة تظهر فيها الأسنان العلوية');
+    add('light', stats.faceL >= t.minL && stats.faceL <= t.maxL && stats.clipFrac <= t.maxClip, 'الإضاءة',
+      stats.faceL < t.minL ? 'الإضاءة ضعيفة: صوّر قرب نافذة أو شغّل الضوء' : 'إضاءة قوية جداً أو فلاش مباشر على الأسنان');
+    add('sharp', stats.sharpness >= t.minSharp, 'الوضوح', 'الصورة مهزوزة أو غير مركّزة: ثبّت الجوال');
+    return { ok: items.every((i) => i.ok), items, pose: ps, open, mouthW };
+  }
+
+  // Affine crop around the mouth, aligned to the eye line. Aspect 1.6:1 so squashing to the model square matches training distortion.
+  function mouthCrop(P, opts = {}) {
+    const aspect = opts.aspect || 1.6, widen = opts.widen || 1.18;
+    const ps = pose(P);
+    const inner = innerLipPolygon(P);
+    const c = { x: inner.reduce((s, p) => s + p.x, 0) / inner.length, y: inner.reduce((s, p) => s + p.y, 0) / inner.length };
+    const Wc = dist(P[LM.commA], P[LM.commB]) * widen, Hc = Wc / aspect;
+    const outW = Math.round(clamp(Wc, opts.minOut || 384, opts.maxOut || 1024)), outH = Math.round(outW / aspect);
+    const s = Wc / outW, a = ps.roll * Math.PI / 180, cs = Math.cos(a) * s, sn = Math.sin(a) * s;
+    // crop (u,v) → image (x,y) = c + R(roll)·s·(u − outW/2, v − outH/2)
+    const M = [cs, -sn, c.x - cs * outW / 2 + sn * outH / 2, sn, cs, c.y - sn * outW / 2 - cs * outH / 2];
+    return { M, Minv: invertAffine(M), outW, outH, scale: s, roll: ps.roll, center: c, Hc };
+  }
+  function invertAffine(M) {
+    const [a, b, c, d, e, f] = M, det = a * e - b * d;
+    return [e / det, -b / det, (b * f - c * e) / det, -d / det, a / det, (c * d - a * f) / det];
+  }
+  const applyAffine = (M, p) => ({ x: M[0] * p.x + M[1] * p.y + M[2], y: M[3] * p.x + M[4] * p.y + M[5] });
+
+  function pointInPoly(x, y, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const a = poly[i], b = poly[j];
+      if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+    }
+    return inside;
+  }
+  function rasterPoly(poly, w, h) {
+    const m = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const xs = [], yy = y + 0.5;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const a = poly[i], b = poly[j];
+        if ((a.y > yy) !== (b.y > yy)) xs.push((b.x - a.x) * (yy - a.y) / (b.y - a.y) + a.x);
+      }
+      xs.sort((p, q) => p - q);
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        const xa = Math.max(0, Math.ceil(xs[k] - 0.5)), xb = Math.min(w - 1, Math.floor(xs[k + 1] - 0.5));
+        for (let x = xa; x <= xb; x++) m[y * w + x] = 1;
+      }
+    }
+    return m;
+  }
+  function dilate(m, w, h, r) {
+    let cur = m;
+    for (let k = 0; k < r; k++) {
+      const out = new Uint8Array(cur);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const i = y * w + x; if (cur[i]) continue;
+        if ((x > 0 && cur[i - 1]) || (x < w - 1 && cur[i + 1]) || (y > 0 && cur[i - w]) || (y < h - 1 && cur[i + w])) out[i] = 1;
+      }
+      cur = out;
+    }
+    return cur;
+  }
+  // y of a lip chain (array of points sorted or not) at x, linear interpolation
+  function chainY(chain, x) {
+    const s = [...chain].sort((a, b) => a.x - b.x);
+    if (x <= s[0].x) return s[0].y; if (x >= s[s.length - 1].x) return s[s.length - 1].y;
+    for (let i = 1; i < s.length; i++) if (x <= s[i].x) { const k = (x - s[i - 1].x) / ((s[i].x - s[i - 1].x) || 1); return s[i - 1].y + k * (s[i].y - s[i - 1].y); }
+    return s[s.length - 1].y;
+  }
+
+  // Pick the upper six teeth from a model label map of the mouth crop.
+  // labels/conf: S×S (crop squashed to square). lips: {upper:[pts], lower:[pts], poly:[pts]} in CROP pixels.
+  function selectUpperTeeth(labels, conf, S, cropW, cropH, lips, opts = {}) {
+    const sx = cropW / S, sy = cropH / S;
+    const toL = (p) => ({ x: p.x / sx, y: p.y / sy });
+    const polyL = lips.poly.map(toL), upL = lips.upper.map(toL), loL = lips.lower.map(toL);
+    const inMouth = dilate(rasterPoly(polyL, S, S), S, S, opts.lipMargin ?? 3);
+    const minArea = (opts.minFrac ?? 0.0025) * S * S;
+    const seen = new Uint8Array(S * S), stack = new Int32Array(S * S);
+    const chosen = {}, rejected = [];
+    for (let c = 1; c <= 6; c++) {
+      let best = null;
+      for (let i0 = 0; i0 < S * S; i0++) {
+        if (labels[i0] !== c || seen[i0] || !inMouth[i0]) continue;
+        let sp = 0; stack[sp++] = i0; seen[i0] = 1;
+        const comp = []; let cx = 0, cs = 0, ymin = S;
+        while (sp) {
+          const k = stack[--sp]; comp.push(k);
+          const x = k % S, y = (k / S) | 0; cx += x; cs += conf ? conf[k] : 1; if (y < ymin) ymin = y;
+          if (x > 0 && labels[k - 1] === c && !seen[k - 1] && inMouth[k - 1]) { seen[k - 1] = 1; stack[sp++] = k - 1; }
+          if (x < S - 1 && labels[k + 1] === c && !seen[k + 1] && inMouth[k + 1]) { seen[k + 1] = 1; stack[sp++] = k + 1; }
+          if (y > 0 && labels[k - S] === c && !seen[k - S] && inMouth[k - S]) { seen[k - S] = 1; stack[sp++] = k - S; }
+          if (y < S - 1 && labels[k + S] === c && !seen[k + S] && inMouth[k + S]) { seen[k + S] = 1; stack[sp++] = k + S; }
+        }
+        if (comp.length < minArea) continue;
+        const mx = cx / comp.length, uy = chainY(upL, mx), ly = chainY(loL, mx);
+        const openH = Math.max(1, ly - uy);
+        // an upper tooth starts at the upper lip / gum line; a component that starts in the lower part of the mouth is a lower tooth
+        if (ymin > uy + (opts.lowerStart ?? 0.45) * openH) { rejected.push({ c, area: comp.length, reason: 'lower' }); continue; }
+        if (!best || comp.length > best.comp.length) best = { comp, conf: cs / comp.length, mx };
+      }
+      if (best) chosen[c] = best;
+    }
+    const clean = new Uint8Array(S * S);
+    const teeth = {}, info = {}, centers = {};
+    let confSum = 0, confN = 0;
+    for (const t of TEETH) {
+      const c = C.CLASS_OF[t], b = chosen[c];
+      if (!b) { info[t] = { present: false }; continue; }
+      const xs = [], ys = [];
+      for (const k of b.comp) { clean[k] = c; xs.push((k % S + 0.5) * sx); ys.push((((k / S) | 0) + 0.5) * sy); }
+      xs.sort((p, q) => p - q); ys.sort((p, q) => p - q);
+      const q = (a, p) => a[Math.min(a.length - 1, Math.round(p / 100 * (a.length - 1)))];
+      teeth[t] = { x0: q(xs, 1), x1: q(xs, 99), y0: q(ys, 1), y1: q(ys, 99) };
+      // an upper tooth merged with the lower tooth below it is far too tall: cut at the dark occlusal line between them
+      if (opts.rgba) {
+        const cut = occlusalCut(opts.rgba, cropW, cropH, teeth[t], t);
+        if (cut != null) {
+          teeth[t].y1 = cut; teeth[t].cut = true;
+          for (const k of b.comp) if ((((k / S) | 0) + 0.5) * sy > cut) clean[k] = 0;
+        }
+      }
+      centers[t] = b.mx * sx;
+      info[t] = { present: true, area: b.comp.length / (S * S), conf: b.conf };
+      confSum += b.conf * b.comp.length; confN += b.comp.length;
+    }
+    const order = TEETH.filter((t) => teeth[t]).map((t) => centers[t]);
+    let orderOk = order.length >= 2;
+    for (let k = 1; k < order.length; k++) if (order[k] <= order[k - 1]) orderOk = false;
+    return { teeth, info, clean, orderOk, meanConf: confN ? confSum / confN : 0, presentCount: Object.keys(teeth).length, rejected };
+  }
+
+  const EXPECT_WL = { '13': 0.80, '12': 0.75, '11': 0.80, '21': 0.80, '22': 0.75, '23': 0.80 };
+  function occlusalCut(rgba, w, h, box, t) {
+    const bw = box.x1 - box.x0, bh = box.y1 - box.y0, expH = bw / EXPECT_WL[t];
+    if (bh <= 1.05 * expH) return null;
+    const xa = Math.round(box.x0 + 0.2 * bw), xb = Math.round(box.x1 - 0.2 * bw);
+    const ya = Math.round(box.y0 + 0.55 * expH), yb = Math.round(box.y1);
+    const rows = [];
+    for (let y = Math.max(0, Math.round(box.y0)); y <= Math.min(h - 1, yb); y++) {
+      let s = 0, n = 0;
+      for (let x = Math.max(0, xa); x <= Math.min(w - 1, xb); x++) { const i = (y * w + x) * 4; s += 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2]; n++; }
+      rows.push({ y, L: n ? s / n : 0 });
+    }
+    const sm = rows.map((r, i) => ({ y: r.y, L: (rows[Math.max(0, i - 1)].L + r.L + rows[Math.min(rows.length - 1, i + 1)].L) / 3 }));
+    const cand = sm.filter((r) => r.y >= ya && r.y <= yb - 2);
+    if (!cand.length) return null;
+    const v = cand.reduce((a, b) => (b.L < a.L ? b : a));
+    const above = sm.filter((r) => r.y < v.y && r.y >= box.y0 + 0.2 * expH).map((r) => r.L).sort((a, b) => a - b);
+    const ref = above.length ? above[Math.floor(above.length / 2)] : 0;
+    if (ref - v.L < 25) return null;
+    // a real occlusal line has tooth-bright rows again below it (a translucent incisal edge does not)
+    const brightBelow = sm.filter((r) => r.y > v.y + 1 && r.L > ref - 30).length;
+    return brightBelow >= 3 ? v.y : null;
+  }
+
+  // Decide why a tooth was not found: 'missing' (a real gap between neighbours) or 'hidden' (behind the lips / out of view)
+  function classifyAbsent(sel, rgba, w, h, lips) {
+    const status = {};
+    const present = TEETH.filter((t) => sel.teeth[t]);
+    if (!present.length) return status;
+    const IDEAL = { '13': 0.49, '12': 0.7, '11': 1, '21': 1, '22': 0.7, '23': 0.49 };
+    const unit = present.reduce((s, t) => s + (sel.teeth[t].x1 - sel.teeth[t].x0) / IDEAL[t], 0) / present.length;
+    for (let i = 0; i < 6; i++) {
+      const t = TEETH[i]; if (sel.teeth[t]) continue;
+      let L = null, R = null;
+      for (let k = i - 1; k >= 0; k--) if (sel.teeth[TEETH[k]]) { L = TEETH[k]; break; }
+      for (let k = i + 1; k < 6; k++) if (sel.teeth[TEETH[k]]) { R = TEETH[k]; break; }
+      if (L && R) {
+        const gap = sel.teeth[R].x0 - sel.teeth[L].x1;
+        // dark gap between neighbours → tooth missing; otherwise neighbours already touch (model merged/missed it)
+        status[t] = gap >= 0.45 * unit * IDEAL[t] && darkFraction(rgba, w, h, sel.teeth[L].x1, sel.teeth[R].x0, sel.teeth[L], sel.teeth[R]) > 0.45 ? 'missing' : 'unsure';
+      } else status[t] = 'hidden';
+    }
+    return status;
+  }
+  function darkFraction(rgba, w, h, xa, xb, A, B) {
+    const y0 = Math.round(Math.max(A.y0, B.y0)), y1 = Math.round(Math.min(A.y1, B.y1));
+    let n = 0, d = 0;
+    for (let y = Math.max(0, y0); y <= Math.min(h - 1, y1); y += 2) for (let x = Math.max(0, Math.round(xa)); x <= Math.min(w - 1, Math.round(xb)); x += 2) {
+      const i = (y * w + x) * 4; n++; if (0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2] < 90) d++;
+    }
+    return n ? d / n : 0;
+  }
+
+  function irisMmPerPx(P) {
+    const d = [];
+    if (P[469] && P[471]) d.push(dist(P[469], P[471]));
+    if (P[474] && P[476]) d.push(dist(P[474], P[476]));
+    if (!d.length) return null;
+    const px = d.reduce((a, b) => a + b, 0) / d.length;
+    return px > 4 ? IRIS_MM / px : null;
+  }
+
+  // Shape incisal edges into an arc parallel to the lower lip. target: boxes (crop px); lowerY(x): lower-lip y in crop px.
+  function applySmileArc(target, lowerY, mmpp, opts = {}) {
+    const out = {}; for (const t of TEETH) if (target[t]) out[t] = { ...target[t] };
+    if (!out['11'] || !out['21']) return out;
+    const midX = (out['11'].x1 + out['21'].x0) / 2;
+    const dL = (opts.lengthDeltaMm || 0) / (mmpp || 1) * (mmpp ? 1 : 0);
+    const yc = (out['11'].y1 + out['21'].y1) / 2 + dL;
+    const step = { '12': 0.75, '22': 0.75, '13': 0.25, '23': 0.25 };
+    const lipMid = lowerY(midX), follow = opts.follow ?? 0.85;
+    const L11 = yc - (out['11'].y0 + out['21'].y0) / 2;
+    for (const t of TEETH) {
+      const b = out[t]; if (!b) continue;
+      const cx = (b.x0 + b.x1) / 2;
+      let y1 = yc + Math.min(0, (lowerY(cx) - lipMid)) * follow;          // lateral teeth rise with the lip, never drop below the centrals
+      if (step[t]) y1 -= mmpp ? step[t] / mmpp : L11 * 0.07 * step[t] / 0.75;
+      if (t === '11' || t === '21') y1 = yc;
+      y1 = Math.min(y1, yc);
+      out[t].y1 = Math.max(b.y0 + 0.55 * L11, y1);
+    }
+    return out;
+  }
+
+  // Keep automatic changes within what is usually achievable with veneers/crowns; the doctor can go further on purpose.
+  function limitChanges(current, target, mmpp, lim = {}) {
+    const L = Object.assign({ shortenMm: 1.5, lengthenMm: 2.5, widthMm: 1.5 }, lim), out = {};
+    const px = (mm) => mmpp ? mm / mmpp : null;
+    for (const t of TEETH) {
+      const a = current[t], b = target[t]; if (!b) continue; out[t] = { ...b };
+      if (!a || !mmpp) continue;
+      out[t].y1 = clamp(b.y1, a.y1 - px(L.shortenMm), a.y1 + px(L.lengthenMm));
+    }
+    return out;
+  }
+
+  // Points for DSDCore.faceAnalysis from landmarks (image px) and tooth boxes (crop px → image via M)
+  function facePoints(P, teethCrop, M, extents) {
+    const [pR, pL] = eyes(P);
+    const cA = P[LM.commA], cB = P[LM.commB], [cR, cL] = cA.x <= cB.x ? [cA, cB] : [cB, cA];
+    const pts = { pupilR: pR, pupilL: pL, glabella: P[LM.glabella], subnasale: P[LM.subnasale], menton: P[LM.menton], commR: cR, commL: cL,
+      upperLip: P[LM.upperInner], lowerLipMid: P[LM.lowerInner] };
+    const lower = INNER_LOWER.map((i) => P[i]);
+    const T = teethCrop || {};
+    const toImg = (x, y) => applyAffine(M, { x, y });
+    const cx = (b) => (b.x0 + b.x1) / 2;
+    if (T['11']) { pts.zenith11 = toImg(cx(T['11']), T['11'].y0); pts.incisal11 = toImg(cx(T['11']), T['11'].y1); }
+    if (T['11'] && T['21']) pts.midlineDental = toImg((T['11'].x1 + T['21'].x0) / 2, (T['11'].y1 + T['21'].y1) / 2 - (T['11'].y1 - T['11'].y0) * 0.05);
+    if (T['13']) pts.cusp13 = toImg(cx(T['13']), T['13'].y1);
+    if (T['23']) pts.cusp23 = toImg(cx(T['23']), T['23'].y1);
+    if (pts.cusp13) pts.lowerLipR = { x: pts.cusp13.x, y: chainY(lower, pts.cusp13.x) };
+    if (pts.cusp23) pts.lowerLipL = { x: pts.cusp23.x, y: chainY(lower, pts.cusp23.x) };
+    if (extents) { pts.lastR = toImg(extents.x0, extents.y); pts.lastL = toImg(extents.x1, extents.y); }
+    return pts;
+  }
+
+  // Horizontal extent of the visible dentition (bright, low-chroma pixels) inside the mouth crop, for the buccal corridor.
+  function dentitionExtent(rgba, w, h, mouthMask) {
+    const col = new Float32Array(w), cnt = new Float32Array(w);
+    let ys = 0, yn = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const k = y * w + x; if (!mouthMask[k]) continue;
+      const i = k * 4, r = rgba[i], g = rgba[i + 1], b = rgba[i + 2], L = 0.299 * r + 0.587 * g + 0.114 * b;
+      cnt[x]++;
+      if (L > 120 && Math.max(r, g, b) - Math.min(r, g, b) < 80) { col[x]++; ys += y; yn++; }
+    }
+    let x0 = -1, x1 = -1;
+    for (let x = 0; x < w; x++) if (cnt[x] > 2 && col[x] / cnt[x] > 0.25) { if (x0 < 0) x0 = x; x1 = x; }
+    return x0 < 0 ? null : { x0, x1, y: yn ? ys / yn : h / 2 };
+  }
+
+  const api = { LM, INNER_UPPER, INNER_LOWER, OUTER_LIP, IRIS_MM, QUALITY_DEFAULTS, toPx, uprightTurns, eyes, pose, innerLipPolygon, imageStats,
+    qualityChecks, mouthCrop, invertAffine, applyAffine, pointInPoly, rasterPoly, dilate, chainY, selectUpperTeeth, classifyAbsent,
+    irisMmPerPx, applySmileArc, limitChanges, facePoints, dentitionExtent };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.DSDSmile = api;
+})(typeof window !== 'undefined' ? window : globalThis);
